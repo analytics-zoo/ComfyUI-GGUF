@@ -7,14 +7,20 @@ import logging
 # ============================================================================
 # Triton Kernel Support
 # ============================================================================
-try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-    logging.info("ComfyUI-GGUF: Triton available, enabling optimized kernels")
-except ImportError:
+import platform
+
+if platform.system() == "Windows":
     HAS_TRITON = False
-    logging.info("ComfyUI-GGUF: Triton not available, using PyTorch fallback")
+    logging.info("ComfyUI-GGUF: Triton not supported on Windows, using PyTorch fallback")
+else:
+    try:
+        import triton
+        import triton.language as tl
+        HAS_TRITON = True
+        logging.info("ComfyUI-GGUF: Triton available, enabling optimized kernels")
+    except ImportError:
+        HAS_TRITON = False
+        logging.info("ComfyUI-GGUF: Triton not available, using PyTorch fallback")
 
 # Configuration flags
 USE_TRITON_KERNELS = True  # Set to False to disable Triton even if available

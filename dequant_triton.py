@@ -2,14 +2,19 @@
 # Triton kernel optimizations for GGUF dequantization on Intel XPU
 import torch
 import logging
+import platform
 
-try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-except ImportError:
+if platform.system() == "Windows":
     HAS_TRITON = False
-    logging.warning("ComfyUI-GGUF: Triton not available, falling back to PyTorch implementation")
+    logging.info("ComfyUI-GGUF: Triton not supported on Windows, falling back to PyTorch implementation")
+else:
+    try:
+        import triton
+        import triton.language as tl
+        HAS_TRITON = True
+    except ImportError:
+        HAS_TRITON = False
+        logging.warning("ComfyUI-GGUF: Triton not available, falling back to PyTorch implementation")
 
 
 if HAS_TRITON:
