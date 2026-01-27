@@ -25,6 +25,79 @@ else:
 # Configuration flags
 USE_TRITON_KERNELS = True  # Set to False to disable Triton even if available
 USE_TORCH_COMPILE = False   # Disable torch.compile if using Triton
+# ============================================================================
+# Intel ESIMD Kernel Support (High Performance on Intel XPU)
+# Uses omni_xpu_kernel for optimized ESIMD kernels (~70 GB/s on Intel Max GPU)
+# ============================================================================
+HAS_ESIMD = False
+omni_xpu_gguf = None
+try:
+    from omni_xpu_kernel import gguf as _omni_gguf
+    omni_xpu_gguf = _omni_gguf
+    HAS_ESIMD = True
+    logging.info("ComfyUI-GGUF: omni_xpu_kernel ESIMD available, enabling high-performance kernels")
+except ImportError as e:
+    # Handle DLL loading errors on Windows gracefully
+    error_msg = str(e)
+    if platform.system() == "Windows" and "DLL load failed" in error_msg:
+        logging.warning(
+            f"ComfyUI-GGUF: omni_xpu_kernel DLL load failed on Windows. "
+            f"Make sure to run Intel oneAPI setvars.bat before starting ComfyUI. "
+            f"Error: {error_msg}"
+        )
+    else:
+        logging.info(f"ComfyUI-GGUF: omni_xpu_kernel not available ({type(e).__name__}), using fallback")
+except Exception as e:
+    logging.info(f"ComfyUI-GGUF: omni_xpu_kernel not available ({type(e).__name__}: {e}), using fallback")
+
+USE_ESIMD_KERNELS = True  # Set to False to disable ESIMD even if available
+
+
+def get_kernel_info():
+    """
+    Get information about available kernels and which will be used.
+    
+    Returns a dict with backend availability and selection priority.
+    
+    Usage:
+        from dequant import get_kernel_info
+        info = get_kernel_info()
+        print(info)
+    """
+    info = {
+        "backends": {
+            "ESIMD": {"available": HAS_ESIMD, "enabled": USE_ESIMD_KERNELS},
+            "Triton": {"available": HAS_TRITON, "enabled": USE_TRITON_KERNELS},
+            "PyTorch": {"available": True, "enabled": True},
+        },
+        "selection_priority": [],
+        "Q4_0_kernel": None,
+        "Q8_0_kernel": None,
+        "Q4_1_kernel": None,
+    }
+    
+    # Determine Q4_0 kernel (XPU)
+    if HAS_ESIMD and USE_ESIMD_KERNELS:
+        info["Q4_0_kernel"] = "ESIMD (~70 GB/s)"
+        info["selection_priority"].append("ESIMD (Q4_0 on XPU)")
+    elif HAS_TRITON and USE_TRITON_KERNELS:
+        info["Q4_0_kernel"] = "Triton (~48 GB/s)"
+    else:
+        info["Q4_0_kernel"] = "PyTorch (~5 GB/s)"
+    
+    # Determine Q8_0/Q4_1 kernel
+    if HAS_TRITON and USE_TRITON_KERNELS:
+        info["Q8_0_kernel"] = "Triton"
+        info["Q4_1_kernel"] = "Triton"
+        info["selection_priority"].append("Triton (Q8_0, Q4_1 on XPU/CUDA)")
+    else:
+        info["Q8_0_kernel"] = "PyTorch"
+        info["Q4_1_kernel"] = "PyTorch"
+    
+    info["selection_priority"].append("PyTorch (fallback)")
+    
+    return info
+
 
 # ============================================================================
 # Triton Kernels for Q4_0 and Q8_0
@@ -274,6 +347,7 @@ def is_torch_compatible(tensor):
 def is_quantized(tensor):
     return not is_torch_compatible(tensor)
 
+@torch.compiler.disable()
 def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
     qtype = getattr(tensor, "tensor_type", None)
     oshape = getattr(tensor, "tensor_shape", tensor.shape)
@@ -289,9 +363,41 @@ def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
         new = gguf.quants.dequantize(tensor.cpu().numpy(), qtype)
         return torch.from_numpy(new).to(tensor.device, dtype=dtype)
 
+
+# ============================================================================
+# ESIMD Dequantization Wrappers (for ComfyUI format)
+# Using omni_xpu_kernel for ~70 GB/s performance on Intel XPU
+# ============================================================================
+def _dequantize_q4_0_esimd(blocks, block_size, type_size, dtype=None):
+    """
+    ESIMD Q4_0 dequantization - High performance on Intel XPU
+    Uses sequential output layout matching PyTorch implementation
+    
+    Performance: ~70 GB/s on Intel Data Center GPU Max Series
+    """
+    n_blocks = blocks.shape[0]
+    flat_input = blocks.flatten().contiguous()
+    
+    # Use omni_xpu_kernel ESIMD kernel with ComfyUI format (sequential layout)
+    output = omni_xpu_gguf.dequantize_q4_0_comfyui(
+        flat_input, 
+        dtype if dtype is not None else torch.float16
+    )
+    
+    # Reshape to match expected output: [n_blocks, block_size]
+    return output.reshape(n_blocks, block_size)
+
+# Debug flag for kernel selection logging
+DEBUG_KERNEL_SELECTION = False
+
 def dequantize(data, qtype, oshape, dtype=None):
     """
     Dequantize tensor back to usable shape/dtype
+    
+    Kernel selection priority:
+    1. ESIMD (Intel XPU only, Q4_0) - ~70 GB/s, 1.46x faster than Triton
+    2. Triton (XPU/CUDA, Q4_0/Q8_0/Q4_1) - ~48 GB/s
+    3. PyTorch (fallback) - ~5 GB/s
     """
     block_size, type_size = gguf.GGML_QUANT_SIZES[qtype]
     
@@ -305,19 +411,35 @@ def dequantize(data, qtype, oshape, dtype=None):
     # Select dequantization implementation
     device_type = data.device.type
     
-    # Try Triton kernels first (best performance)
+    # Try ESIMD kernels first (best performance on Intel XPU)
+    if HAS_ESIMD and USE_ESIMD_KERNELS and device_type == 'xpu':
+        if qtype == gguf.GGMLQuantizationType.Q4_0:
+            if DEBUG_KERNEL_SELECTION:
+                logging.info(f"ComfyUI-GGUF: Using ESIMD kernel for Q4_0 ({n_blocks} blocks)")
+            result = _dequantize_q4_0_esimd(blocks, block_size, type_size, dtype)
+            return result.reshape(oshape)
+    
+    # Try Triton kernels next (best performance)
     if HAS_TRITON and USE_TRITON_KERNELS and device_type in ('xpu', 'cuda'):
         if qtype == gguf.GGMLQuantizationType.Q4_0:
+            if DEBUG_KERNEL_SELECTION:
+                logging.info(f"ComfyUI-GGUF: Using Triton kernel for Q4_0 ({n_blocks} blocks)")
             result = _dequantize_q4_0_triton(blocks, block_size, type_size, dtype)
             return result.reshape(oshape)
         elif qtype == gguf.GGMLQuantizationType.Q8_0:
+            if DEBUG_KERNEL_SELECTION:
+                logging.info(f"ComfyUI-GGUF: Using Triton kernel for Q8_0 ({n_blocks} blocks)")
             result = _dequantize_q8_0_triton(blocks, block_size, type_size, dtype)
             return result.reshape(oshape)
         elif qtype == gguf.GGMLQuantizationType.Q4_1:
+            if DEBUG_KERNEL_SELECTION:
+                logging.info(f"ComfyUI-GGUF: Using Triton kernel for Q4_1 ({n_blocks} blocks)")
             result = _dequantize_q4_1_triton(blocks, block_size, type_size, dtype)
             return result.reshape(oshape)
     
     # Fallback to PyTorch implementation
+    if DEBUG_KERNEL_SELECTION:
+        logging.info(f"ComfyUI-GGUF: Using PyTorch fallback for {qtype.name} ({n_blocks} blocks)")
     dequantize_blocks = dequantize_functions[qtype]
     
     # Optionally use torch.compile for other quantization types
