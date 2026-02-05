@@ -13,7 +13,7 @@ This fork includes **high-performance dequantization kernels optimized for Intel
 
 ### Supported Quantization Formats
 
-| Format | ESIMD (XPU) | Triton (XPU/CUDA) | PyTorch (from city96/ComfyUI-GGUF) |
+| Format | ESIMD (XPU) | Triton | PyTorch (from city96/ComfyUI-GGUF) |
 |--------|-------------|-------------------|-------------------|
 | Q4_0 | ✅ | ✅ | ✅ |
 | Q8_0 | ✅ | ✅ | ✅ |
